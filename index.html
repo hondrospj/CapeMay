@@ -2205,35 +2205,73 @@ async function fetchPETSSForecast_MLLW({ hours = 48 } = {}){
 /* =========================
 NOAA observations fetch (NAVD)
 ========================= */
-async function fetchObservedSeries({startISO=null,endISO=null} = {}){
-  const url = new URL("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter");
-  url.searchParams.set("product", "water_level");
-  url.searchParams.set("station", NOAA_OBS_STATION);
-  url.searchParams.set("datum", "NAVD");
-  url.searchParams.set("units", "english");
-  url.searchParams.set("time_zone", "gmt");
-  url.searchParams.set("format", "json");
-  url.searchParams.set("application", COOPS_APP);
-
-  if(startISO) url.searchParams.set("begin_date", yyyymmddUTC(new Date(startISO)));
-  if(endISO)   url.searchParams.set("end_date", yyyymmddUTC(new Date(endISO)));
-
-  const res = await fetch(url.toString(), { cache:"no-store" });
-  if(!res.ok) throw new Error("NOAA observations failed " + res.status);
-
-  const j = await res.json();
-  if(j?.error?.message) throw new Error(j.error.message);
-
-  const arr = Array.isArray(j?.data) ? j.data : [];
-  return arr
-    .map(v => {
-      const ft = Number(v.v);
-      if(!Number.isFinite(ft) || !v.t) return null;
-      return { t: v.t.replace(" ", "T") + ":00Z", ft };
-    })
-    .filter(Boolean);
+function startOfUTCDate(d){
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
+function addDaysUTC(d, days){
+  const x = new Date(d.getTime());
+  x.setUTCDate(x.getUTCDate() + days);
+  return x;
+}
+
+function yyyymmddUTC(d){
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const da = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}${m}${da}`;
+}
+
+async function fetchObservedSeries({startISO=null,endISO=null} = {}){
+  if(!startISO || !endISO) throw new Error("fetchObservedSeries requires startISO and endISO");
+
+  const start = new Date(startISO);
+  const end = new Date(endISO);
+  if(Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())){
+    throw new Error("Invalid startISO/endISO");
+  }
+
+  const out = [];
+  let cur = startOfUTCDate(start);
+  const endDay = startOfUTCDate(end);
+
+  while(cur <= endDay){
+    const chunkEnd = addDaysUTC(cur, 30);
+    const actualEnd = chunkEnd < endDay ? chunkEnd : endDay;
+
+    const url = new URL("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter");
+    url.searchParams.set("product", "water_level");
+    url.searchParams.set("station", NOAA_OBS_STATION);
+    url.searchParams.set("datum", "NAVD");
+    url.searchParams.set("units", "english");
+    url.searchParams.set("time_zone", "gmt");
+    url.searchParams.set("format", "json");
+    url.searchParams.set("application", COOPS_APP);
+    url.searchParams.set("begin_date", yyyymmddUTC(cur));
+    url.searchParams.set("end_date", yyyymmddUTC(actualEnd));
+
+    const res = await fetch(url.toString(), { cache:"no-store" });
+    if(!res.ok) throw new Error("NOAA observations failed " + res.status);
+
+    const j = await res.json();
+    if(j?.error?.message) throw new Error(j.error.message);
+
+    const arr = Array.isArray(j?.data) ? j.data : [];
+    for(const v of arr){
+      const ft = Number(v.v);
+      if(!Number.isFinite(ft) || !v.t) continue;
+      out.push({
+        t: v.t.replace(" ", "T") + ":00Z",
+        ft
+      });
+    }
+
+    cur = addDaysUTC(actualEnd, 1);
+  }
+
+  out.sort((a,b)=> new Date(a.t) - new Date(b.t));
+  return out;
+}
 /* =========================
 NOAA/NWS NWPS official forecast (GRWN4) -> we resample to 15-min later
 Replaces CO-OPS predictions block.
@@ -3923,7 +3961,7 @@ async function updateLiveAndAnnualCounts(){
   const startISO = startOfYearEST_ISO(curYear);
   const endISO   = nowISO();
 
-  const ytd = await fetchObservedSeries({ startISO, endISO });
+  async function fetchObservedSeries({startISO=null,endISO=null} = {}){
   if(!ytd.length) throw new Error("no live water-level data returned from USGS");
 
   STATE.ytdNavd  = ytd;

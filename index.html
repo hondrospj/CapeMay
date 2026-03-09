@@ -3958,11 +3958,11 @@ async function updateLiveAndAnnualCounts(){
 
   // ---- Live observed series YTD (NAVD88) ----
   const { y: curYear } = getESTParts(new Date());
-  const startISO = startOfYearEST_ISO(curYear);
-  const endISO   = nowISO();
+ const startISO = startOfYearEST_ISO(curYear);
+const endISO   = nowISO();
 
-  async function fetchObservedSeries({startISO=null,endISO=null} = {}){
-  if(!ytd.length) throw new Error("no live water-level data returned from USGS");
+const ytd = await fetchObservedSeries({ startISO, endISO });
+if(!ytd.length) throw new Error("no live water-level data returned from NOAA");
 
   STATE.ytdNavd  = ytd;
   STATE.lastNavd = ytd[ytd.length - 1];

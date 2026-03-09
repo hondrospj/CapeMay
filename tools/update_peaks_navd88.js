@@ -119,29 +119,58 @@ function classifyNAVD(ft, T) {
 // -------------------------
 // USGS IV fetch (15-min-ish)
 // -------------------------
-async function fetchUSGSIV({ startISO, endISO }) {
-  const url =
-    "https://waterservices.usgs.gov/nwis/iv/?" +
-    new URLSearchParams({
-      format: "json",
-      sites: SITE,
-      parameterCd: PARAM,
-      startDT: startISO,
-      endDT: endISO,
-      siteStatus: "all",
-      agencyCd: "USGS"
-    }).toString();
+async function fetchNOAAObservedWaterLevels({ startISO, endISO }) {
+  const start = new Date(startISO);
+  const end = new Date(endISO);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw new Error("Invalid startISO/endISO for NOAA observations.");
+  }
 
-  const res = await fetch(url, { headers: { "User-Agent": "peaks-cache/2.0" } });
-  if (!res.ok) throw new Error(`USGS IV fetch failed: ${res.status} ${res.statusText}`);
-  const j = await res.json();
+  const series = [];
+  let cur = startOfUTCDate(start);
+  const endDay = startOfUTCDate(end);
 
-  const ts = j?.value?.timeSeries?.[0];
-  const vals = ts?.values?.[0]?.value || [];
+  while (cur <= endDay) {
+    const chunkEnd = addDaysUTC(cur, 30);
+    const actualEnd = chunkEnd < endDay ? chunkEnd : endDay;
 
-  const series = vals
-    .map(v => ({ t: v.dateTime, ft: Number(v.value) }))
-    .filter(p => p.t && Number.isFinite(p.ft));
+    const url =
+      "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?" +
+      new URLSearchParams({
+        product: "water_level",
+        application: "peaks-cache",
+        format: "json",
+        station: NOAA_OBS_STATION,
+        time_zone: "gmt",
+        units: "english",
+        datum: NOAA_OBS_DATUM,
+        begin_date: yyyymmddUTC(cur),
+        end_date: yyyymmddUTC(actualEnd)
+      }).toString();
+
+    const res = await fetch(url, { headers: { "User-Agent": "peaks-cache/2.0" } });
+    if (!res.ok) throw new Error(`NOAA observations fetch failed: ${res.status} ${res.statusText}`);
+
+    const j = await res.json();
+    if (j?.error?.message) throw new Error(`NOAA observations error: ${j.error.message}`);
+
+    const arr = Array.isArray(j?.data) ? j.data : [];
+    for (const p of arr) {
+      const ft = Number(p.v);
+      if (!Number.isFinite(ft) || !p.t) continue;
+
+      const iso = p.t.replace(" ", "T") + ":00Z";
+      const ms = new Date(iso).getTime();
+      if (!Number.isFinite(ms)) continue;
+
+      series.push({
+        t: new Date(ms).toISOString(),
+        ft
+      });
+    }
+
+    cur = addDaysUTC(actualEnd, 1);
+  }
 
   series.sort((a, b) => new Date(a.t) - new Date(b.t));
   return series;
@@ -172,7 +201,7 @@ async function fetchNOAAHiloPredictionsHighs({ startISO, endISO }) {
         product: "predictions",
         application: "peaks-cache",
         format: "json",
-        station: NOAA_STATION,
+        station: NOAA_TIDECLOCK_STATION,
         time_zone: "gmt",
         units: "english",
         interval: "hilo",
@@ -269,8 +298,8 @@ async function main() {
   const cache = loadJSON(CACHE_PATH);
 
   // Ensure required metadata exists (you already store these)
-  cache.site = cache.site || SITE;
-  cache.parameterCd = cache.parameterCd || PARAM;
+ cache.site = cache.site || NOAA_OBS_STATION;
+delete cache.parameterCd;
   cache.datum = cache.datum || "NAVD88";
   cache.peakMinSepMinutes = cache.peakMinSepMinutes || PEAK_MIN_SEP_MINUTES;
 
@@ -320,8 +349,8 @@ async function main() {
     console.log(`Incremental: ${startISO} → ${endISO}`);
   }
 
-  // 1) Fetch observed series from USGS
-  const series = await fetchUSGSIV({ startISO, endISO });
+// 1) Fetch observed series from NOAA
+const series = await fetchNOAAObservedWaterLevels({ startISO, endISO });
   if (!series.length) {
     console.log("No series points returned; nothing to do.");
     return;

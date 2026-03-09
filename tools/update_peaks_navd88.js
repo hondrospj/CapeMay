@@ -30,6 +30,7 @@ const CACHE_PATH = path.join(__dirname, "..", "data", "peaks_navd88.json");
 const NOAA_OBS_STATION = "8536110";      // Cape May NOAA observations
 const NOAA_TIDECLOCK_STATION = "8536110"; // use Cape May NOAA highs too
 const NOAA_OBS_DATUM = "NAVD";
+const NAVD_MINUS_MLLW = -3.27;
 
 // Keep this in cache for transparency; we still keep your 5-hour constant in JSON,
 // but we are no longer using declustering for cache building under this method.
@@ -119,6 +120,45 @@ function classifyNAVD(ft, T) {
 // -------------------------
 // USGS IV fetch (15-min-ish)
 // -------------------------
+async function fetchNOAAWaterLevelChunk({ station, product, datum, beginDate, endDate }) {
+  const url =
+    "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?" +
+    new URLSearchParams({
+      product,
+      application: "peaks-cache",
+      format: "json",
+      station,
+      time_zone: "gmt",
+      units: "english",
+      datum,
+      begin_date: beginDate,
+      end_date: endDate
+    }).toString();
+
+  const res = await fetch(url, { headers: { "User-Agent": "peaks-cache/2.0" } });
+  if (!res.ok) {
+    throw new Error(`NOAA fetch failed: ${res.status} ${res.statusText}`);
+  }
+
+  const j = await res.json();
+  if (j?.error?.message) {
+    throw new Error(j.error.message);
+  }
+
+  const arr = Array.isArray(j?.data) ? j.data : [];
+  return arr
+    .map(p => {
+      const ft = Number(p.v);
+      if (!Number.isFinite(ft) || !p.t) return null;
+
+      return {
+        t: new Date(String(p.t).replace(" ", "T") + "Z").toISOString(),
+        ft
+      };
+    })
+    .filter(Boolean);
+}
+
 async function fetchNOAAObservedWaterLevels({ startISO, endISO }) {
   const start = new Date(startISO);
   const end = new Date(endISO);
@@ -134,41 +174,54 @@ async function fetchNOAAObservedWaterLevels({ startISO, endISO }) {
     const chunkEnd = addDaysUTC(cur, 30);
     const actualEnd = chunkEnd < endDay ? chunkEnd : endDay;
 
-    const url =
-      "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?" +
-      new URLSearchParams({
-        product: "water_level",
-        application: "peaks-cache",
-        format: "json",
+    const beginDate = yyyymmddUTC(cur);
+    const endDate = yyyymmddUTC(actualEnd);
+
+    let chunk = [];
+
+    try {
+      // First try: NOAA 6-minute water_level in NAVD
+      chunk = await fetchNOAAWaterLevelChunk({
         station: NOAA_OBS_STATION,
-        time_zone: "gmt",
-        units: "english",
-        datum: NOAA_OBS_DATUM,
-        begin_date: yyyymmddUTC(cur),
-        end_date: yyyymmddUTC(actualEnd)
-      }).toString();
-
-    const res = await fetch(url, { headers: { "User-Agent": "peaks-cache/2.0" } });
-    if (!res.ok) throw new Error(`NOAA observations fetch failed: ${res.status} ${res.statusText}`);
-
-    const j = await res.json();
-    if (j?.error?.message) throw new Error(`NOAA observations error: ${j.error.message}`);
-
-    const arr = Array.isArray(j?.data) ? j.data : [];
-    for (const p of arr) {
-      const ft = Number(p.v);
-      if (!Number.isFinite(ft) || !p.t) continue;
-
-      const iso = p.t.replace(" ", "T") + ":00Z";
-      const ms = new Date(iso).getTime();
-      if (!Number.isFinite(ms)) continue;
-
-      series.push({
-        t: new Date(ms).toISOString(),
-        ft
+        product: "water_level",
+        datum: "NAVD",
+        beginDate,
+        endDate
       });
+    } catch (errNavd) {
+      const navdMsg = String(errNavd?.message || errNavd);
+
+      try {
+        // Fallback: NOAA 6-minute water_level in MLLW
+        const mllwChunk = await fetchNOAAWaterLevelChunk({
+          station: NOAA_OBS_STATION,
+          product: "water_level",
+          datum: "MLLW",
+          beginDate,
+          endDate
+        });
+
+        chunk = mllwChunk.map(p => ({
+          t: p.t,
+          ft: roundFt(p.ft + NAVD_MINUS_MLLW)
+        }));
+
+        console.log(`Fallback used for ${beginDate}-${endDate}: water_level MLLW -> NAVD`);
+      } catch (errMllw) {
+        const mllwMsg = String(errMllw?.message || errMllw);
+
+        // Do NOT crash the whole workflow just because one chunk failed
+        console.warn(
+          `Skipping observations chunk ${beginDate}-${endDate}. ` +
+          `NAVD failed: ${navdMsg}. ` +
+          `MLLW failed: ${mllwMsg}.`
+        );
+
+        chunk = [];
+      }
     }
 
+    series.push(...chunk);
     cur = addDaysUTC(actualEnd, 1);
   }
 
